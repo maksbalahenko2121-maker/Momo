@@ -18,7 +18,7 @@ from pydantic import BaseModel, Field
 
  
 
-BOT_TOKEN = os.getenv("BOT_TOKEN") or "8835996385:AAGxRtzsgtu-yUO0JcZZSLAsP8oYh8v-VXs"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "8835996385:AAHXGJfH4TewLUFIDNXrBtdomKT1plizfcg"
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or "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"
 
