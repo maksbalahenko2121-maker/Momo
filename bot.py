@@ -502,26 +502,38 @@ async def chat(msg: types.Message):
 
  
 
-async def main():
+from aiohttp import web
+
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
+
+ 
+
+WEBHOOK_URL = "bot-1795495938-3693-hopsik.bothost.tech"
+
+ 
+
+async def on_startup(bot: Bot):
+
+    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+
+ 
+
+def main():
 
     db_init()
 
-    while True:
+    dp.startup.register(on_startup)
 
-        try:
+    app = web.Application()
 
-            await dp.start_polling(bot, skip_updates=True)
+    SimpleRequestHandler(dispatcher=dp, bot=bot).register(app, path="/webhook")
 
-            break
+    setup_application(app, dp, bot=bot)
 
-        except Exception as e:
-
-            logging.warning(f"Ждём снятия лимита Telegram: {e}")
-
-            await asyncio.sleep(40)
+    web.run_app(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
 
  
 
 if __name__ == "__main__":
 
-    asyncio.run(main())
+    main()
