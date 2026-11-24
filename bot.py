@@ -498,9 +498,19 @@ async def main():
 
     db_init()
 
-    await asyncio.sleep(5)
+    while True:
 
-    await dp.start_polling(bot, skip_updates=True)
+        try:
+
+            await dp.start_polling(bot, skip_updates=True)
+
+            break
+
+        except Exception as e:
+
+            logging.warning(f"Ждём снятия лимита Telegram: {e}")
+
+            await asyncio.sleep(40)
 
  
 
