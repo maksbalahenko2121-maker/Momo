@@ -1,10 +1,4 @@
-import os
-
-import random
-
-import asyncio
-
-import logging
+import os, random, asyncio, sqlite3, json, time, logging
 
 from aiogram import Bot, Dispatcher, types, F
 
@@ -18,25 +12,17 @@ from aiogram.utils.keyboard import InlineKeyboardBuilder, ReplyKeyboardBuilder
 
 from google import genai
 
-from google.genai import types as genai_types
+from google.genai import types as gtypes
 
 from pydantic import BaseModel, Field
 
-from database import (
-
-    init_db, get_user, update_user, get_setting, set_setting,
-
-    register_group, get_all_users, get_all_groups, get_stats_data
-
-)
-
  
 
-BOT_TOKEN = "8835996385:AAFbYgX6Jc-PRnfEsBPoX040FLh0Uu6OL1c"
+BOT_TOKEN = os.getenv("BOT_TOKEN") or "8835996385:AAFbYgX6Jc-PRnfEsBPoX040FLh0Uu6OL1c"
 
-GEMINI_API_KEY = "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"
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or "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"
 
-ADMIN_ID = "6921885296", "0"
+ADMIN_ID = int(os.getenv("ADMIN_ID") or "6921885296")
 
  
 
@@ -46,53 +32,103 @@ bot = Bot(token=BOT_TOKEN)
 
 dp = Dispatcher()
 
-client = genai.Client(api_key=GEMINI_API_KEY)
+ai = genai.Client(api_key=GEMINI_API_KEY)
+
+DB = "bot.db"
 
  
 
-GIFTS = {
-
-    "choco": ("🍫 Молочный шоколад", 30, 8),
-
-    "tea": ("🧋 Бабл-ти", 60, 18),
-
-    "plush": ("🧸 Плюшевый котик", 150, 45),
-
-    "ring": ("💍 Серебряное колечко", 350, 110),
-
-}
+GIFTS = {"choco": ("🍫 Шоколадка", 30, 8), "tea": ("🧋 Бабл-ти", 60, 18), "plush": ("🧸 Плюшевый кот", 150, 45), "ring": ("💍 Колечко", 350, 110)}
 
  
 
-class AdminStates(StatesGroup):
+class AdminState(StatesGroup):
 
-    waiting_broadcast_pm = State()
+    cast_pm = State()
 
-    waiting_broadcast_groups = State()
+    cast_grp = State()
 
-    waiting_channel = State()
-
- 
-
-class TsundereReply(BaseModel):
-
-    reply: str = Field(description="Ответ персонажа с РП-действиями в звёздочках *действие*")
-
-    affection_change: int = Field(description="Изменение симпатии: строго от -3 до +2 за сообщение игрока")
+    set_ch = State()
 
  
 
-def main_menu() -> types.ReplyKeyboardMarkup:
+class ReplySchema(BaseModel):
+
+    reply: str = Field(description="Ответ цундере с РП-действиями в *звёздочках*")
+
+    affection_change: int = Field(description="Оценка фразы игрока: строго от -3 до +2")
+
+ 
+
+def db_init():
+
+    with sqlite3.connect(DB) as c:
+
+        c.execute("CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, aff INTEGER DEFAULT 10, coins INTEGER DEFAULT 20, hist TEXT DEFAULT '[]', last INTEGER DEFAULT 0)")
+
+        c.execute("CREATE TABLE IF NOT EXISTS groups (id INTEGER PRIMARY KEY)")
+
+        c.execute("CREATE TABLE IF NOT EXISTS cfg (k TEXT PRIMARY KEY, v TEXT)")
+
+        for k, v in [("photo", ""), ("sub_on", "0"), ("sub_ch", ""), ("sub_url", "")]:
+
+            c.execute("INSERT OR IGNORE INTO cfg VALUES (?, ?)", (k, v))
+
+ 
+
+def get_cfg(k: str) -> str:
+
+    with sqlite3.connect(DB) as c:
+
+        row = c.execute("SELECT v FROM cfg WHERE k=?", (k,)).fetchone()
+
+        return row[0] if row else ""
+
+ 
+
+def set_cfg(k: str, v: str):
+
+    with sqlite3.connect(DB) as c:
+
+        c.execute("INSERT OR REPLACE INTO cfg VALUES (?, ?)", (k, v))
+
+ 
+
+def get_user(uid: int):
+
+    now = int(time.time())
+
+    with sqlite3.connect(DB) as c:
+
+        row = c.execute("SELECT aff, coins, hist FROM users WHERE id=?", (uid,)).fetchone()
+
+        if not row:
+
+            c.execute("INSERT INTO users VALUES (?, 10, 20, '[]', ?)", (uid, now))
+
+            return 10, 20, []
+
+        aff, coins, h_str = row
+
+        c.execute("UPDATE users SET last=? WHERE id=?", (now, uid))
+
+        return aff, coins, json.loads(h_str)
+
+ 
+
+def save_user(uid: int, aff: int, coins: int, hist: list):
+
+    with sqlite3.connect(DB) as c:
+
+        c.execute("UPDATE users SET aff=?, coins=?, hist=?, last=? WHERE id=?", (max(0, min(500, aff)), max(0, coins), json.dumps(hist[-15:], ensure_ascii=False), int(time.time()), uid))
+
+ 
+
+def menu_kb():
 
     kb = ReplyKeyboardBuilder()
 
-    kb.button(text="📊 Профиль")
-
-    kb.button(text="🎮 Мини-игра")
-
-    kb.button(text="🎁 Магазин")
-
-    kb.button(text="🔄 Сброс")
+    for b in ["📊 Профиль", "🎮 Мини-игра", "🎁 Магазин", "🔄 Сброс"]: kb.button(text=b)
 
     kb.adjust(2, 2)
 
@@ -100,297 +136,195 @@ def main_menu() -> types.ReplyKeyboardMarkup:
 
  
 
-def get_personality_prompt(affection: int) -> str:
+async def is_sub(uid: int) -> bool:
 
-    base = (
+    if uid == ADMIN_ID or get_cfg("sub_on") != "1" or not get_cfg("sub_ch"): return True
 
-        "Ты — девушка-цундере в текстовой РП-игре. Отвечай на русском языке, коротко, живо и эмоционально. "
+    try: return (await bot.get_chat_member(get_cfg("sub_ch"), uid)).status in ("member", "administrator", "creator")
 
-        "Обязательно используй РП-действия в звёздочках (например: *скрестила руки*, *отвернулась, густо покраснев*). "
-
-        "Оцени сообщение игрока и верни affection_change: +1 или +2 (только если игрок реально милый, заботится или смешит), "
-
-        "0 (если обычный разговор) или от -1 до -3 (если грубит или тупит). Доверие заслужить очень трудно!\n"
-
-    )
-
-    if affection <= 100:
-
-        stage = f"Симпатия: {affection}/500 (Стадия 1: Злая хамка). Ты грубая, язвительная, обзывай игрока дураком (без матов), огрызайся."
-
-    elif affection <= 250:
-
-        stage = f"Симпатия: {affection}/500 (Стадия 2: Ворчливая цундере). Грубишь по привычке, но на комплименты сильно смущаешься, заикаешься ('Ч-чего?!'), краснеешь."
-
-    elif affection <= 400:
-
-        stage = f"Симпатия: {affection}/500 (Стадия 3: Скрытая симпатия). Тебе нравится игрок, но гордость мешает признаться. Заботишься под видом критики."
-
-    else:
-
-        stage = f"Симпатия: {affection}/500 (Стадия 4: Влюблённая). Общаешься нежно и тепло, лишь изредка мило дуешься по старой привычке."
-
-    return base + stage
+    except Exception: return True
 
  
 
-async def check_subscription(user_id: int) -> bool:
-
-    if user_id == ADMIN_ID or get_setting("sub_required") != "1":
-
-        return True
-
-    channel = get_setting("sub_channel")
-
-    if not channel:
-
-        return True
-
-    try:
-
-        member = await bot.get_chat_member(chat_id=channel, user_id=user_id)
-
-        return member.status in ("member", "administrator", "creator")
-
-    except Exception:
-
-        return True
-
- 
-
-async def send_sub_prompt(message: types.Message):
-
-    link = get_setting("sub_link") or "https://t.me"
+async def ask_sub(msg: types.Message):
 
     kb = InlineKeyboardBuilder()
 
-    kb.button(text="📢 Подписаться на канал", url=link)
+    kb.button(text="📢 Подписаться", url=get_cfg("sub_url") or "https://t.me")
 
-    kb.button(text="✅ Я подписался", callback_data="check_sub")
+    kb.button(text="✅ Проверить", callback_data="chk_sub")
 
     kb.adjust(1)
 
-    await message.answer("*скрестила руки*\nЭй, бака! Я не буду с тобой говорить, пока не подпишешься на канал!", reply_markup=kb.as_markup())
+    await msg.answer("*скрестила руки* Эй, бака! Сначала подпишись на канал, потом поговорим!", reply_markup=kb.as_markup())
 
  
 
-@dp.callback_query(F.data == "check_sub")
+@dp.callback_query(F.data == "chk_sub")
 
-async def cb_check_sub(callback: types.CallbackQuery):
+async def cb_sub(cb: types.CallbackQuery):
 
-    if await check_subscription(callback.from_user.id):
+    if await is_sub(cb.from_user.id):
 
-        await callback.message.delete()
+        await cb.message.delete()
 
-        await callback.message.answer("*фыркнула* Ладно, вижу подписку. Можешь писать, дурак.", reply_markup=main_menu())
+        await cb.message.answer("*фыркнула* Ладно, вижу подписку. Пиши, дурак.", reply_markup=menu_kb())
 
-    else:
-
-        await callback.answer("Ты всё ещё не подписан!", show_alert=True)
+    else: await cb.answer("Ты ещё не подписался!", show_alert=True)
 
  
 
 @dp.message(Command("setphoto"), F.photo)
 
-async def cmd_setphoto(message: types.Message):
+async def cmd_photo(msg: types.Message):
 
-    if message.from_user.id != ADMIN_ID:
+    if msg.from_user.id == ADMIN_ID:
 
-        return
+        set_cfg("photo", msg.photo.pop().file_id)
 
-    set_setting("start_photo", message.photo[-1].file_id)
-
-    await message.answer("✅ Новое фото персонажа сохранено!")
+        await msg.answer("✅ Фото персонажа установлено!")
 
  
 
 @dp.message(Command("start"))
 
-async def cmd_start(message: types.Message):
+async def cmd_start(msg: types.Message):
 
-    if message.chat.type in ("group", "supergroup"):
+    if msg.chat.type in ("group", "supergroup"):
 
-        register_group(message.chat.id, message.chat.title or "Группа")
+        with sqlite3.connect(DB) as c: c.execute("INSERT OR IGNORE INTO groups VALUES (?)", (msg.chat.id,))
 
-    get_user(message.from_user.id)
+    get_user(msg.from_user.id)
 
-    text = "*недовольно хмыкнула и скрестила руки*\nЧего уставился? Думаешь, я сразу растаю от пары слов? Как бы не так, бака!"
+    txt = "*недовольно хмыкнула* Чего уставился? Думаешь, я сразу растаю? Как бы не так, бака!"
 
-    photo_id = get_setting("start_photo")
+    kb = menu_kb() if msg.chat.type == "private" else None
 
-    kb = main_menu() if message.chat.type == "private" else None
+    photo = get_cfg("photo")
 
-    if photo_id:
+    if photo: await msg.answer_photo(photo, caption=txt, reply_markup=kb)
 
-        await message.answer_photo(photo=photo_id, caption=text, reply_markup=kb)
+    else: await msg.answer(txt, reply_markup=kb)
 
-    else:
+@dp.message(F.text.in_(["/stats", "📊 Профиль"]))
 
-        await message.answer(text, reply_markup=kb)
+async def cmd_stats(msg: types.Message):
 
- 
+    if not await is_sub(msg.from_user.id): return await ask_sub(msg)
 
-@dp.message(Command("stats"))
+    aff, coins, _ = get_user(msg.from_user.id)
 
-@dp.message(F.text == "📊 Профиль")
+    st = "Злая хамка 💢" if aff <= 100 else "Ворчливая цундере 😳" if aff <= 250 else "Скрывает чувства 💓" if aff <= 400 else "Влюблена 💖"
 
-async def cmd_stats(message: types.Message):
-
-    if not await check_subscription(message.from_user.id):
-
-        return await send_sub_prompt(message)
-
-    affection, coins, _ = get_user(message.from_user.id)
-
-    status = "Злая хамка 💢" if affection <= 100 else "Ворчливая цундере 😳" if affection <= 250 else "Скрывает чувства 💓" if affection <= 400 else "По уши влюблена 💖"
-
-    await message.answer(f"❤️ **Симпатия:** {affection}/500\n🪙 **Цун-коины:** {coins}\n🎭 **Статус:** {status}", parse_mode="Markdown")
+    await msg.answer(f"❤️ Симпатия: **{aff}/500**\n🪙 Цун-коины: **{coins}**\n🎭 Статус: **{st}**", parse_mode="Markdown")
 
  
 
-@dp.message(Command("reset"))
+@dp.message(F.text.in_(["/reset", "🔄 Сброс"]))
 
-@dp.message(F.text == "🔄 Сброс")
+async def cmd_reset(msg: types.Message):
 
-async def cmd_reset(message: types.Message):
+    save_user(msg.from_user.id, 10, 20, [])
 
-    update_user(message.from_user.id, 10, 20, [])
+    await msg.answer("*закатила глаза* Ладно, начинаем заново, дурак. (Симпатия: 10/500, Коины: 20 🪙)")
 
-    await message.answer("*закатила глаза* Ладно, забыли всё. Начинаем с нуля, дурак. (Симпатия: 10/500, Коины: 20 🪙)")
+ 
 
-@dp.message(Command("game"))
+@dp.message(F.text.in_(["/game", "🎮 Мини-игра"]))
 
-@dp.message(F.text == "🎮 Мини-игра")
+async def cmd_game(msg: types.Message):
 
-async def cmd_game(message: types.Message):
-
-    if not await check_subscription(message.from_user.id):
-
-        return await send_sub_prompt(message)
+    if not await is_sub(msg.from_user.id): return await ask_sub(msg)
 
     kb = InlineKeyboardBuilder()
 
-    kb.button(text="🪨 Камень", callback_data="rps_rock")
-
-    kb.button(text="✂️ Ножницы", callback_data="rps_scissors")
-
-    kb.button(text="📄 Бумага", callback_data="rps_paper")
+    for t, d in [("🪨 Камень", "rps_rock"), ("✂️ Ножницы", "rps_scissors"), ("📄 Бумага", "rps_paper")]: kb.button(text=t, callback_data=d)
 
     kb.adjust(3)
 
-    await message.answer("*усмехнулась* Сыграем в «Камень, ножницы, бумага»? Победишь — дам 15 🪙. Выбирай!", reply_markup=kb.as_markup())
+    await msg.answer("*усмехнулась* Сыграем? Победишь — дам 15 🪙. Выбирай!", reply_markup=kb.as_markup())
 
  
 
 @dp.callback_query(F.data.startswith("rps_"))
 
-async def process_rps(callback: types.CallbackQuery):
+async def cb_rps(cb: types.CallbackQuery):
 
-    user_choice = callback.data.split("_")[1]
+    _, u = cb.data.split("_", 1)
 
-    bot_choice = random.choice(["rock", "scissors", "paper"])
+    b = random.choice(["rock", "scissors", "paper"])
 
-    names = {"rock": "🪨 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
+    n = {"rock": "🪨 Камень", "scissors": "✂️ Ножницы", "paper": "📄 Бумага"}
 
-    affection, coins, history = get_user(callback.from_user.id)
+    aff, coins, hist = get_user(cb.from_user.id)
 
- 
+    if u == b: res = f"Оба выбрали {n.get(b)}. *фыркнула* Ничья, повторюшка!"
 
-    if user_choice == bot_choice:
+    elif (u=="rock" and b=="scissors") or (u=="scissors" and b=="paper") or (u=="paper" and b=="rock"):
 
-        result = f"Мы оба выбрали {names[bot_choice]}.\n*фыркнула* Ничья! Повторяешь за мной, дурак?"
+        coins += 15; save_user(cb.from_user.id, aff, coins, hist)
 
-    elif (user_choice == "rock" and bot_choice == "scissors") or (user_choice == "scissors" and bot_choice == "paper") or (user_choice == "paper" and bot_choice == "rock"):
+        res = f"Ты: {n.get(u)} | Я: {n.get(b)}\n*покраснела* Ч-чего?! Ты жульничал! На 15 🪙! (Баланс: {coins} 🪙)"
 
-        coins += 15
+    else: res = f"Ты: {n.get(u)} | Я: {n.get(b)}\n*ухмыльнулась* Ха! Проиграл, бака~"
 
-        update_user(callback.from_user.id, affection, coins, history)
-
-        result = f"Ты: {names[user_choice]} | Я: {names[bot_choice]}\n*покраснела от злости* Ч-чего?! Ты подглядывал! На свои 15 🪙, жулик! (Баланс: {coins} 🪙)"
-
-    else:
-
-        result = f"Ты: {names[user_choice]} | Я: {names[bot_choice]}\n*самодовольно ухмыльнулась* Ха! Проиграл! Учись, бака~"
-
-    await callback.message.edit_text(result)
-
-    await callback.answer()
+    await cb.message.edit_text(res)
 
  
 
-@dp.message(Command("shop"))
+@dp.message(F.text.in_(["/shop", "🎁 Магазин"]))
 
-@dp.message(F.text == "🎁 Магазин")
+async def cmd_shop(msg: types.Message):
 
-async def cmd_shop(message: types.Message):
+    if not await is_sub(msg.from_user.id): return await ask_sub(msg)
 
-    if not await check_subscription(message.from_user.id):
-
-        return await send_sub_prompt(message)
-
-    _, coins, _ = get_user(message.from_user.id)
+    _, coins, _ = get_user(msg.from_user.id)
 
     kb = InlineKeyboardBuilder()
 
-    for key, (name, price, bonus) in GIFTS.items():
-
-        kb.button(text=f"{name} — {price} 🪙 (+{bonus} ❤️)", callback_data=f"buy_{key}")
+    for k, (name, price, bonus) in GIFTS.items(): kb.button(text=f"{name} — {price} 🪙 (+{bonus} ❤️)", callback_data=f"buy_{k}")
 
     kb.adjust(1)
 
-    await message.answer(f"*отвернулась* Я-я вовсе не жду подарков! Просто мимо проходила... (У тебя: {coins} 🪙)", reply_markup=kb.as_markup())
+    await msg.answer(f"*отвернулась* Я не жду подарков! Просто мимо проходила... (У тебя: {coins} 🪙)", reply_markup=kb.as_markup())
 
  
 
 @dp.callback_query(F.data.startswith("buy_"))
 
-async def process_buy(callback: types.CallbackQuery):
+async def cb_buy(cb: types.CallbackQuery):
 
-    gift_key = callback.data.split("_")[1]
+    _, k = cb.data.split("_", 1)
 
-    name, price, bonus = GIFTS[gift_key]
+    name, price, bonus = GIFTS.get(k)
 
-    affection, coins, history = get_user(callback.from_user.id)
+    aff, coins, hist = get_user(cb.from_user.id)
 
-    if coins < price:
+    if coins < price: return await cb.answer("Мало Цун-коинов!", show_alert=True)
 
-        return await callback.answer("Не хватает Цун-коинов! Поиграй в мини-игру или пообщайся со мной.", show_alert=True)
+    coins -= price; aff = min(500, aff + bonus)
 
-    coins -= price
+    hist.append({"role": "user", "text": f"*дарит {name}*"})
 
-    affection = min(500, affection + bonus)
+    save_user(cb.from_user.id, aff, coins, hist)
 
-    history.append({"role": "user", "text": f"*дарит тебе {name}*"})
-
-    update_user(callback.from_user.id, affection, coins, history)
-
-    await callback.message.edit_text(
-
-        f"🎁 Ты подарил: **{name}**\n\n*взяла подарок и густо покраснела* Д-дурак... Зачем ты тратишься?! Н-но спасибо...\n\n📈 Симпатия +{bonus} ({affection}/500) | Остаток: {coins} 🪙",
-
-        parse_mode="Markdown"
-
-    )
-
-    await callback.answer()
+    await cb.message.edit_text(f"🎁 Подарено: **{name}**\n*густо покраснела* Д-дурак... Зачем тратишься?! Н-но спасибо...\n📈 Симпатия +{bonus} ({aff}/500)", parse_mode="Markdown")
 
  
 
-def admin_keyboard():
-
-    sub_on = get_setting("sub_required") == "1"
+def adm_kb():
 
     kb = InlineKeyboardBuilder()
 
-    kb.button(text="📊 Статистика и активность", callback_data="adm_stats")
+    kb.button(text="📊 Статистика", callback_data="a_stat")
 
-    kb.button(text="✉️ Рассылка в ЛС", callback_data="adm_cast_pm")
+    kb.button(text="✉️ Рассылка ЛС", callback_data="a_pm")
 
-    kb.button(text="👥 Рассылка в группы", callback_data="adm_cast_grp")
+    kb.button(text="👥 Рассылка Группы", callback_data="a_grp")
 
-    kb.button(text="🟢 ОП: ВКЛ" if sub_on else "🔴 ОП: ВЫКЛ", callback_data="adm_toggle_sub")
+    kb.button(text="🟢 ОП: ВКЛ" if get_cfg("sub_on")=="1" else "🔴 ОП: ВЫКЛ", callback_data="a_sub")
 
-    kb.button(text="📢 Настроить канал ОП", callback_data="adm_set_channel")
+    kb.button(text="📢 Канал ОП", callback_data="a_ch")
 
     kb.adjust(1, 2, 2)
 
@@ -400,243 +334,169 @@ def admin_keyboard():
 
 @dp.message(Command("admin"))
 
-async def cmd_admin(message: types.Message, state: FSMContext):
+async def cmd_adm(msg: types.Message, state: FSMContext):
 
-    if message.from_user.id != ADMIN_ID:
+    if msg.from_user.id == ADMIN_ID: await state.clear(); await msg.answer("⚙️ **Админка**", reply_markup=adm_kb(), parse_mode="Markdown")
 
-        return
+ 
+
+@dp.callback_query(F.data == "a_stat")
+
+async def cb_astat(cb: types.CallbackQuery):
+
+    now = int(time.time())
+
+    with sqlite3.connect(DB) as c:
+
+        tot, = c.execute("SELECT COUNT(*) FROM users").fetchone()
+
+        d1, = c.execute("SELECT COUNT(*) FROM users WHERE last>=?", (now-86400,)).fetchone()
+
+        d7, = c.execute("SELECT COUNT(*) FROM users WHERE last>=?", (now-604800,)).fetchone()
+
+        gr, = c.execute("SELECT COUNT(*) FROM groups").fetchone()
+
+    await cb.message.edit_text(f"📊 Всего: **{tot}**\n🔥 За 24ч: **{d1}**\n📅 За 7д: **{d7}**\n💤 Неактивны: **{max(0, tot-d7)}**\n👥 Групп: **{gr}**", reply_markup=adm_kb(), parse_mode="Markdown")
+
+ 
+
+@dp.callback_query(F.data == "a_sub")
+
+async def cb_asub(cb: types.CallbackQuery):
+
+    set_cfg("sub_on", "0" if get_cfg("sub_on")=="1" else "1")
+
+    await cb.message.edit_reply_markup(reply_markup=adm_kb())
+
+ 
+
+@dp.callback_query(F.data == "a_ch")
+
+async def cb_ach(cb: types.CallbackQuery, state: FSMContext):
+
+    await state.set_state(AdminState.set_ch)
+
+    await cb.message.answer("Напиши через пробел: `@канал https://t.me` (Отмена: /cancel)")
+
+ 
+
+@dp.message(AdminState.set_ch)
+
+async def st_ch(msg: types.Message, state: FSMContext):
+
+    if msg.text == "/cancel": await state.clear(); return await msg.answer("Отменено")
+
+    parts = msg.text.split()
+
+    if len(parts) < 2: return await msg.answer("Нужно через пробел: `@канал ссылка`")
+
+    ch, url, *_ = parts
+
+    set_cfg("sub_ch", ch); set_cfg("sub_url", url); await state.clear()
+
+    await msg.answer(f"✅ Канал {ch} сохранён!", reply_markup=adm_kb())
+
+ 
+
+@dp.callback_query(F.data.in_(["a_pm", "a_grp"]))
+
+async def cb_acast(cb: types.CallbackQuery, state: FSMContext):
+
+    await state.set_state(AdminState.cast_pm if cb.data=="a_pm" else AdminState.cast_grp)
+
+    await cb.message.answer("Отправь пост (текст или фото) для рассылки. Отмена: /cancel")
+
+ 
+
+@dp.message(AdminState.cast_pm)
+
+@dp.message(AdminState.cast_grp)
+
+async def st_cast(msg: types.Message, state: FSMContext):
+
+    if msg.text == "/cancel": await state.clear(); return await msg.answer("Отменено")
+
+    is_pm = (await state.get_state()) == AdminState.cast_pm
 
     await state.clear()
 
-    await message.answer("⚙️ **Панель администратора**", reply_markup=admin_keyboard(), parse_mode="Markdown")
+    with sqlite3.connect(DB) as c: rows = c.execute("SELECT id FROM users" if is_pm else "SELECT id FROM groups").fetchall()
 
- 
+    ok, err = 0, 0
 
-@dp.callback_query(F.data == "adm_stats")
+    m = await msg.answer(f"⏳ Рассылка ({len(rows)})...")
 
-async def adm_stats(callback: types.CallbackQuery):
+    for (cid,) in rows:
 
-    if callback.from_user.id != ADMIN_ID:
+        try: await msg.copy_to(cid); ok += 1; await asyncio.sleep(0.05)
 
-        return
+        except Exception: err += 1
 
-    total, act_24, act_7, groups = get_stats_data()
-
-    text = f"📊 **Статистика:**\n👤 Всего: **{total}**\n🔥 За 24ч: **{act_24}**\n📅 За 7д: **{act_7}**\n💤 Неактивны: **{max(0, total - act_7)}**\n👥 Групп: **{groups}**"
-
-    await callback.message.edit_text(text, reply_markup=admin_keyboard(), parse_mode="Markdown")
-
-    await callback.answer()
-
- 
-
-@dp.callback_query(F.data == "adm_toggle_sub")
-
-async def adm_toggle_sub(callback: types.CallbackQuery):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        return
-
-    set_setting("sub_required", "0" if get_setting("sub_required") == "1" else "1")
-
-    await callback.message.edit_reply_markup(reply_markup=admin_keyboard())
-
-    await callback.answer("Статус ОП изменён!")
-
- 
-
-@dp.callback_query(F.data == "adm_set_channel")
-
-async def adm_set_channel(callback: types.CallbackQuery, state: FSMContext):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        return
-
-    await state.set_state(AdminStates.waiting_channel)
-
-    await callback.message.answer("Отправь через пробел:\n`@канал https://t.me`\n(Бот должен быть админом канала. Отмена: /cancel)")
-
-    await callback.answer()
-
- 
-
-@dp.message(AdminStates.waiting_channel)
-
-async def save_channel(message: types.Message, state: FSMContext):
-
-    if message.text == "/cancel":
-
-        await state.clear()
-
-        return await message.answer("Отменено.")
-
-    parts = message.text.split()
-
-    if len(parts) < 2:
-
-        return await message.answer("Нужно через пробел: `@канал https://t.me`")
-
-    set_setting("sub_channel", parts[0])
-
-    set_setting("sub_link", parts[1])
-
-    await state.clear()
-
-    await message.answer(f"✅ Канал ОП сохранён: {parts[0]}", reply_markup=admin_keyboard())
-
- 
-
-@dp.callback_query(F.data.in_(["adm_cast_pm", "adm_cast_grp"]))
-
-async def adm_cast_start(callback: types.CallbackQuery, state: FSMContext):
-
-    if callback.from_user.id != ADMIN_ID:
-
-        return
-
-    await state.set_state(AdminStates.waiting_broadcast_pm if callback.data == "adm_cast_pm" else AdminStates.waiting_broadcast_groups)
-
-    await callback.message.answer("Отправь пост (текст или фото) для рассылки. Отмена: /cancel")
-
-    await callback.answer()
-
- 
-
-@dp.message(AdminStates.waiting_broadcast_pm)
-
-@dp.message(AdminStates.waiting_broadcast_groups)
-
-async def execute_broadcast(message: types.Message, state: FSMContext):
-
-    if message.text == "/cancel":
-
-        await state.clear()
-
-        return await message.answer("Отменено.")
-
-    targets = get_all_users() if await state.get_state() == AdminStates.waiting_broadcast_pm else get_all_groups()
-
-    await state.clear()
-
-    sent, failed = 0, 0
-
-    msg = await message.answer(f"⏳ Рассылка по {len(targets)} чатам...")
-
-    for cid in targets:
-
-        try:
-
-            await message.copy_to(chat_id=cid)
-
-            sent += 1
-
-            await asyncio.sleep(0.05)
-
-        except Exception:
-
-            failed += 1
-
-    await msg.edit_text(f"✅ Готово! Доставлено: **{sent}**, ошибок: **{failed}**", parse_mode="Markdown")
+    await m.edit_text(f"✅ Доставлено: **{ok}**, ошибок: **{err}**", parse_mode="Markdown")
 
  
 
 @dp.message()
 
-async def chat_handler(message: types.Message):
+async def chat(msg: types.Message):
 
-    if message.chat.type in ("group", "supergroup"):
+    if msg.chat.type in ("group", "supergroup"):
 
-        register_group(message.chat.id, message.chat.title or "Группа")
+        with sqlite3.connect(DB) as c: c.execute("INSERT OR IGNORE INTO groups VALUES (?)", (msg.chat.id,))
 
-        bot_info = await bot.get_me()
+        me = await bot.get_me()
 
-        is_reply = message.reply_to_message and message.reply_to_message.from_user.id == bot_info.id
+        if not ((msg.reply_to_message and msg.reply_to_message.from_user.id == me.id) or (msg.text and f"@{me.username}" in msg.text)): return
 
-        is_mentioned = message.text and f"@{bot_info.username}" in message.text
+    if not msg.text or not await is_sub(msg.from_user.id):
 
-        if not (is_reply or is_mentioned):
-
-            return
-
-    if not message.text:
+        if msg.text: await ask_sub(msg)
 
         return
 
-    if not await check_subscription(message.from_user.id):
+    aff, coins, hist = get_user(msg.from_user.id)
 
-        return await send_sub_prompt(message)
+    await bot.send_chat_action(msg.chat.id, "typing")
 
- 
+    stage = "Злая хамка, груби и обзывай дураком" if aff<=100 else "Ворчливая цундере, груби, но сильно смущайся и заикайся на комплименты" if aff<=250 else "Скрытая симпатия, заботься под видом критики" if aff<=400 else "Влюблена, общайся нежно и тепло"
 
-    user_id = message.from_user.id
+    prompt = f"Ты девушка-цундере в РП. Пиши коротко на русском, используй *действия*. Симпатия: {aff}/500 ({stage}). Оцени фразу игрока: affection_change от -3 до +2."
 
-    affection, coins, history = get_user(user_id)
+    contents = [gtypes.Content(role=m.get("role"), parts=[gtypes.Part.from_text(text=m.get("text"))]) for m in hist]
 
-    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
-
- 
-
-    contents = [genai_types.Content(role=m["role"], parts=[genai_types.Part.from_text(text=m["text"])]) for m in history]
-
-    contents.append(genai_types.Content(role="user", parts=[genai_types.Part.from_text(text=message.text)]))
-
- 
+    contents.append(gtypes.Content(role="user", parts=[gtypes.Part.from_text(text=msg.text)]))
 
     try:
 
-        response = client.models.generate_content(
+        res = ai.models.generate_content(model="gemini-2.5-flash", contents=contents, config=gtypes.GenerateContentConfig(system_instruction=prompt, response_mime_type="application/json", response_schema=ReplySchema, temperature=0.9))
 
-            model="gemini-2.5-flash",
+        data = ReplySchema.model_validate_json(res.text)
 
-            contents=contents,
+        chg = max(-3, min(2, data.affection_change))
 
-            config=genai_types.GenerateContentConfig(
+        aff = max(0, min(500, aff + chg))
 
-                system_instruction=get_personality_prompt(affection),
+        earned = 5 if chg > 0 else 0
 
-                response_mime_type="application/json",
+        hist.extend([{"role": "user", "text": msg.text}, {"role": "model", "text": data.reply}])
 
-                response_schema=TsundereReply,
+        save_user(msg.from_user.id, aff, coins + earned, hist)
 
-                temperature=0.9,
+        badge = f"\n\n📈 *Симпатия +{chg} ({aff}/500) | +{earned} 🪙*" if chg > 0 else f"\n\n📉 *Симпатия {chg} ({aff}/500)*" if chg < 0 else ""
 
-            ),
-
-        )
-
-        data = TsundereReply.model_validate_json(response.text)
-
-        change = max(-3, min(2, data.affection_change))
-
-        new_affection = max(0, min(500, affection + change))
-
-        earned = 5 if change > 0 else 0
-
-        history.append({"role": "user", "text": message.text})
-
-        history.append({"role": "model", "text": data.reply})
-
-        update_user(user_id, new_affection, coins + earned, history)
-
- 
-
-        badge = f"\n\n📈 *Симпатия +{change} ({new_affection}/500) | +{earned} 🪙*" if change > 0 else f"\n\n📉 *Симпатия {change} ({new_affection}/500)*" if change < 0 else ""
-
-        await message.reply(data.reply + badge, parse_mode="Markdown")
+        await msg.reply(data.reply + badge, parse_mode="Markdown")
 
     except Exception as e:
 
-        logging.error(f"Gemini error: {e}")
+        logging.error(e)
 
-        await message.answer("*отвернулась* Тц, голова разболелась... Повтори позже.")
+        await msg.answer("*отвернулась* Тц, голова разболелась... Повтори позже.")
 
  
 
 async def main():
 
-    init_db()
+    db_init()
 
     await dp.start_polling(bot)
 
