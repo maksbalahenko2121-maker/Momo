@@ -498,7 +498,9 @@ async def main():
 
     db_init()
 
-    await dp.start_polling(bot)
+    await asyncio.sleep(5)
+
+    await dp.start_polling(bot, skip_updates=True)
 
  
 
