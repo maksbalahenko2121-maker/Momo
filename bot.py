@@ -508,21 +508,15 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
  
 
-WEBHOOK_URL = "bot-1795495938-3693-hopsik.bothost.tech"
+from aiohttp import web
 
- 
-
-async def on_startup(bot: Bot):
-
-    await bot.set_webhook(WEBHOOK_URL, drop_pending_updates=True)
+from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_application
 
  
 
 def main():
 
     db_init()
-
-    dp.startup.register(on_startup)
 
     app = web.Application()
 
