@@ -30,6 +30,14 @@ logging.basicConfig(level=logging.INFO)
 
 bot = Bot(token=BOT_TOKEN)
 
+async def fake_me():
+
+    bot_id = int(BOT_TOKEN.split(":")[0]) if ":" in BOT_TOKEN else 0
+
+    return types.User(id=bot_id, is_bot=True, first_name="TsundereBot", username="my_bot")
+
+bot.me = fake_me
+
 dp = Dispatcher()
 
 ai = genai.Client(api_key=GEMINI_API_KEY)
